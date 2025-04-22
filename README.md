@@ -85,7 +85,7 @@ If you find Zeus relevant to your research, please consider citing:
 ```
 
 
-## This fork is for integrating Energy Profiler in Zeus.
+## This fork is for integrating Energy Profiler in PFO.
 
 ### Running Instructions Below
 
@@ -141,17 +141,17 @@ uvicorn zeus.optimizer.pipeline_frequency.server.router:app --port 7787
 
 ```bash
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-  cd workspace/zeus/megatron
+cd workspace/zeus/megatron
 ./run_training.sh --pfo-server-url "http://localhost:7787"
 ```
 
-<mark>Once it runs, the csv file can be found in the dump directory, one sample file is already present there.</mark>
+<mark>Once it runs, the csv file can be found in the 'megatron/dump' directory, one sample file is already present there.</mark>
 
 ### 5. (Optional) Delete old checkpoints on the host:
-
+```bash
 HOST_DIR= < pathTo >/megatron/experiments
 docker run --rm -v "$HOST_DIR":/mnt alpine sh -c 'rm -rf /mnt/codeparrot-small'
-
+```
 
 
 ## Data Preparation
