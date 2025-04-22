@@ -84,6 +84,120 @@ If you find Zeus relevant to your research, please consider citing:
 }
 ```
 
+
+This fork is for integrating Energy Profiler in Zeus.
+Running Instructions
+
+### 1. Create a **Dockerfile** in your project root:
+
+```bash
+FROM nvcr.io/nvidia/pytorch:24.02-py3
+```
+
+Build the Docker image with host networking:
+```bash
+docker build --network=host -t zeus-megatron .
+```
+
+### 2. Run the container, mounting your local repo:
+
+```bash
+docker run -it --rm \
+  --ipc=host --shm-size=512m --gpus=4 \
+  -v <path>/zeus:/workspace/zeus \
+  -w /workspace/zeus \
+  --cap-add SYS_ADMIN \
+  --network=host \
+  zeus-megatron:latest bash
+```
+
+### 3. Install dependencies and start the PFO server inside the container:
+```bash
+cd workspace/zeus
+pip install -e ".[pfo, pfo-server]". # If this doesn't work, then the below steps one by one
+pip install -e . --upgrade-strategy only-if-needed
+pip install "pydantic<2"
+pip install .[pfo, pfo-server] --no-deps
+pip install aiofiles fastapi starlette uvicorn --no-deps
+pip uninstall pynvml # because we use nvidia-ml-py
+
+# Configure and launch the server on a separate docker root access
+docker ps # for fetching name of your container - e.g. c8dab19234f
+docker exec -it <your-zeus-container-name> bash  # this will lauch another terminal with access to same docker
+export ZEUS_PFO_DUMP_DATA=true
+export ZEUS_PFO_SCHEDULER=InstructionProfiler
+export ZEUS_PFO_SCHEDULER_ARGS='{"solution_path": "/path/to/freqs_pipeline_%05d.py", "dump_dir": "/path/to/dump"}'
+
+uvicorn zeus.optimizer.pipeline_frequency.server.router:app --port 7787
+```
+
+<mark>The server will be accessible at http://127.0.0.1:7787.</mark>
+
+
+### 4. Run model training pointing at the PFO server:
+
+```bash
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+  cd workspace/zeus/megatron
+./run_training.sh --pfo-server-url "http://localhost:7787"
+```
+
+<mark>Once it runs, the csv file can be found in the dump directory, one sample file is already present there.</mark>
+
+### 5. (Optional) Delete old checkpoints on the host:
+
+HOST_DIR= < pathTo >/megatron/experiments
+docker run --rm -v "$HOST_DIR":/mnt alpine sh -c 'rm -rf /mnt/codeparrot-small'
+
+
+
+## Data Preparation
+
+### 1. Download GPT‑2 vocabulary and merges:
+```bash
+cd /workspace/zeus/megatron
+wget https://huggingface.co/gpt2/resolve/main/vocab.json
+wget https://huggingface.co/gpt2/resolve/main/merges.txt
+```
+
+### 2. Subset the CodeParrot dataset:
+
+#### This is alread available in megatron/get_data.py
+```bash
+from datasets import load_dataset
+
+# Load only the first 2,000 samples of the training split
+train_data = load_dataset('codeparrot/codeparrot-clean-train', split='train[:2000]')
+
+# Save the subset in JSON lines format
+train_data.to_json("codeparrot_data.json", lines=True)
+```
+
+<mark>Run the data retrieval script (get_data.py):</mark>
+```bash
+python get_data.py
+```
+
+### 3. Preprocess CodeParrot content for training:
+```bash
+pip install nltk 
+
+python tools/preprocess_data.py \
+  --input codeparrot_data.json \
+  --output-prefix codeparrot \
+  --vocab-file vocab.json \
+  --tokenizer-type GPT2BPETokenizer \
+  --merge-file merges.txt \
+  --json-keys content \
+  --workers 32 \
+  --append-eod
+  
+```
+
+<mark>This outputs two files codeparrot_content_document.idx and codeparrot_content_document.bin which are used in the training. Reference: https://huggingface.co/blog/megatron-training#how-to-train-with-megatron-lm-</mark>
+
+
+
 ## Other Resources
 
 1. Energy-Efficient Deep Learning with PyTorch and Zeus (PyTorch conference 2023): [Recording](https://youtu.be/veM3x9Lhw2A) | [Slides](https://ml.energy/assets/attachments/pytorch_conf_2023_slides.pdf)
