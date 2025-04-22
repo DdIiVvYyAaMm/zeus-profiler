@@ -85,8 +85,9 @@ If you find Zeus relevant to your research, please consider citing:
 ```
 
 
-This fork is for integrating Energy Profiler in Zeus.
-Running Instructions
+## This fork is for integrating Energy Profiler in Zeus.
+
+### Running Instructions Below
 
 ### 1. Create a **Dockerfile** in your project root:
 
