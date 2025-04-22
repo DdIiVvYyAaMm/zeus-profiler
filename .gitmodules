@@ -1,0 +1,4 @@
+[submodule "megatron"]
+	path = megatron
+	url = https://github.com/DdIiVvYyAaMm/Megatron-LM-Perseus.git
+	branch = main
