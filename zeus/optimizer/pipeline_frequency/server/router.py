@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from typing import Callable
+import json
 
-from fastapi import Depends, FastAPI, Response, Request
+from fastapi import Depends, FastAPI, Response, Request, Body
 from fastapi.routing import APIRoute
+import traceback
 
 from zeus.utils.logging import get_logger
-from zeus.utils.pydantic_v1 import BaseModel,
+from zeus.utils.pydantic_v1 import BaseModel
 from zeus.optimizer.pipeline_frequency.common import (
     REGISTER_JOB_URL,
     REGISTER_RANK_URL,
@@ -17,6 +19,7 @@ from zeus.optimizer.pipeline_frequency.common import (
     REPORT_PROFILING_RESULT_URL,
     REPORT_TIMING_URL,
     REPORT_ENERGY_URL,
+    REPORT_SCHEDULE_URL,
     JobInfo,
     RankInfo,
     PFOServerSettings,
@@ -67,14 +70,33 @@ async def startup_hook():
     init_global_job_manager(settings)
 
 
-@app.post(REGISTER_JOB_URL, response_model=str)
+@app.middleware("http")
+async def log_request_body(request: Request, call_next):
+    body = await request.body()
+    try:
+        body_json = json.loads(body)
+    except Exception:
+        body_json = body
+    print("\nDEBUG: Raw request body:", request.method, request.url)
+    response = await call_next(request)
+    return response
+
+
+@app.post(REGISTER_JOB_URL, response_model=str, include_in_schema=False)
 async def register_job(
-    job_info: JobInfo, job_manager: JobManager = Depends(get_global_job_manager)
+    job_info: JobInfo = Body(...), job_manager: JobManager = Depends(get_global_job_manager)
 ) -> str:
     """Register the training job's information in the server."""
-    job_info.set_job_id(scheduler_name=settings.scheduler.__name__)
-    job_manager.register_job(job_info)
-    return job_info.job_id
+    try:
+        print("DEBUG: Received job_info:", job_info.dict())
+        job_info.set_job_id(scheduler_name=settings.scheduler.__name__)
+        job_manager.register_job(job_info)
+        logger.info(">>> register_job() called for %s", job_info)
+        return job_info.job_id
+    except Exception as e:
+        print("ERROR in /register_job endpoint:")
+        traceback.print_exc()
+        raise e
 
 
 @app.post(REGISTER_RANK_URL)
@@ -87,7 +109,7 @@ async def register_rank(
     job_manager.register_rank(job_id, rank_info)
 
 
-@app.get(GET_FREQUENCY_SCHEDULE_URL, response_model=FrequencySchedule)
+@app.get(GET_FREQUENCY_SCHEDULE_URL, response_model=FrequencySchedule, include_in_schema=False)
 async def get_frequency_schedule(
     job_id: str,
     rank: int,
@@ -97,7 +119,7 @@ async def get_frequency_schedule(
     return await job_manager.get_frequency_schedule(job_id, rank)
 
 
-@app.post(REPORT_PROFILING_RESULT_URL)
+@app.post(REPORT_PROFILING_RESULT_URL, include_in_schema=False)
 async def report_profiling_result(
     job_id: str,
     profiling_result: ProfilingResult,
@@ -109,18 +131,18 @@ async def report_profiling_result(
 
 class TimingBreakdownData(BaseModel):
     """Router that handles timing breakdown for a job."""
+
     job_id: str
     rank: int
-    timing_breakdown: dict[str, list[float]]
+    timing_breakdown: dict[str, list[tuple[float, float]]]
+
 
 @app.post(REPORT_TIMING_URL)
 async def report_timing(
     data: TimingBreakdownData,
     job_manager: JobManager = Depends(get_global_job_manager),
 ) -> dict:
-    """
-    Report timing breakdown data for a job.
-    """
+    """Report timing breakdown data for a job."""
     logger.info("Received timing breakdown for job %s, rank %d", data.job_id, data.rank)
     job_manager.report_timing(data)
     return {"status": "success", "message": "Timing breakdown data received."}
@@ -128,18 +150,31 @@ async def report_timing(
 
 class EnergyMeasurementData(BaseModel):
     """Router that handles energy measurements for a job."""
+
     job_id: str
     rank: int
-    energy_measurements: list[float]
+    energy_measurements: list[tuple[float, float]]
+
 
 @app.post(REPORT_ENERGY_URL)
 async def report_energy(
     data: EnergyMeasurementData,
     job_manager: JobManager = Depends(get_global_job_manager),
 ) -> dict:
-    """
-    Report energy measurement data for a job.
-    """
-    logger.info("Received energy measurements for job %s, rank %d", data.job_id, data.rank)
+    """Report energy measurement data for a job."""
+    logger.info(
+        "Received energy measurements for job %s, rank %d", data.job_id, data.rank
+    )
     job_manager.report_energy(data)
     return {"status": "success", "message": "Energy measurement data received."}
+
+
+@app.post(REPORT_SCHEDULE_URL)
+async def report_schedule(
+    job_id: str,
+    schedule: FrequencySchedule,
+    job_manager: JobManager = Depends(get_global_job_manager),
+) -> dict:
+    """Report a full frequency schedule for a rank."""
+    job_manager.report_schedule(job_id,schedule)
+    return {"status": "success", "message": "Frequency schedule data received."}

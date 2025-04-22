@@ -18,7 +18,14 @@ from zeus.optimizer.pipeline_frequency.common import (
     save_sched,
     save_ranks,
 )
-from zeus.optimizer.pipeline_frequency.server.generate_profile_csv import generate_profile_csv
+
+# from zeus.optimizer.pipeline_frequency.server.router import (
+#     TimingBreakdownData,
+#     EnergyMeasurementData,
+# )
+from zeus.optimizer.pipeline_frequency.server.generate_profile_csv import (
+    generate_profile_csv,
+)
 
 from zeus.utils.logging import get_logger
 from zeus.utils.async_utils import create_task
@@ -27,6 +34,7 @@ GLOBAL_JOB_MANAGER: JobManager | None = None
 
 logger = get_logger(__name__)
 
+logger.info(">>> LOADED JobManager from %s", __file__)
 
 class JobManager:
     """A singleton class that manages all states."""
@@ -38,12 +46,15 @@ class JobManager:
         self._job_infos: dict[str, JobInfo] = {}
         self._job_rank_infos: dict[str, list[RankInfo]] = {}
         self._job_tasks: dict[str, asyncio.Task] = {}
-        self._job_result_channels: dict[str, asyncio.Queue[ProfilingResult]] = {}
-        self._job_sched_request_channels: dict[str, asyncio.Queue] = {}
-        self._job_sched_response_channels: dict[str, list[asyncio.Queue]] = {}
+        # self._job_result_channels: dict[str, asyncio.Queue[ProfilingResult]] = {}
+        # self._job_sched_request_channels: dict[str, asyncio.Queue] = {}
+        # self._job_sched_response_channels: dict[str, list[asyncio.Queue]] = {}
         self._job_last_active_time: dict[str, float] = {}
-        self._job_timing_data: dict[str, dict[int, dict[str, list[float]]]] = {}
-        self._job_energy_data: dict[str, dict[int, list[float]]] = {}
+        self._job_timing_data: dict[
+            str, dict[int, dict[str, list[tuple[float, float]]]]
+        ] = {}
+        self._job_energy_data: dict[str, dict[int, list[tuple[float, float]]]] = {}
+        self._job_frequency_data: dict[str, dict[int, list[int]]] = {}
 
         # Spawn cleanup task that evicts the state of jobs that have not been active
         # for a long time.
@@ -64,11 +75,11 @@ class JobManager:
         world_size = job_info.world_size
         self._job_infos[job_id] = job_info
         self._job_rank_infos[job_id] = []
-        self._job_result_channels[job_id] = asyncio.Queue(maxsize=world_size)
-        self._job_sched_request_channels[job_id] = asyncio.Queue(maxsize=world_size)
-        self._job_sched_response_channels[job_id] = [
-            asyncio.Queue(maxsize=1) for _ in range(world_size)
-        ]
+        # self._job_result_channels[job_id] = asyncio.Queue(maxsize=world_size)
+        # self._job_sched_request_channels[job_id] = asyncio.Queue(maxsize=world_size)
+        # self._job_sched_response_channels[job_id] = [
+        #     asyncio.Queue(maxsize=1) for _ in range(world_size)
+        # ]
         self._job_tasks[job_id] = create_task(
             self._job_task(job_id, self.pfo_settings.dump_data),
             logger=logger,
@@ -76,6 +87,7 @@ class JobManager:
         self._job_last_active_time[job_id] = time.monotonic()
         self._job_timing_data[job_id] = {}
         self._job_energy_data[job_id] = {}
+        self._job_frequency_data[job_id] = {}
 
     def register_rank(self, job_id: str, rank_info: RankInfo) -> None:
         """Register rank-specific information for an already registered job.
@@ -85,28 +97,27 @@ class JobManager:
         self._job_rank_infos[job_id].append(rank_info)
         self._job_last_active_time[job_id] = time.monotonic()
 
-    async def get_frequency_schedule(self, job_id: str, rank: int) -> FrequencySchedule:
-        """Get the next frequency schedule for a rank.
-
-        This method will be called `world_size` number of times (once per rank).
-        All ranks will block on this method untill everyone reports their
-        profiling results and calls this method.
-
-        When an internal scheduler error happened at any point of servicing the
-        job, clients will be notified through this API with a 500 Internal Error.
+    async def get_frequency_schedule(
+        self, job_id: str, rank: int
+    ) -> FrequencySchedule:
         """
-        await self._job_sched_request_channels[job_id].put(rank)
-        res = await self._job_sched_response_channels[job_id][rank].get()
-        if isinstance(res, Exception):
-            code = 400 if isinstance(res, ValueError) else 500
-            raise HTTPException(
-                status_code=code,
-                detail="".join(
-                    traceback.format_exception(type(res), res, res.__traceback__)
-                ),
-            )
-        self._job_last_active_time[job_id] = time.monotonic()
-        return res
+        Return *every* frequency this rank supports, so the client can
+        locally profile them all.
+        """
+        # 1) sanity
+        if job_id not in self._job_rank_infos:
+            raise HTTPException(404, f"Unknown job {job_id}")
+        # 2) pick out the RankInfo
+        infos = self._job_rank_infos[job_id]
+        ri = next((r for r in infos if r.rank == rank), None)
+        if ri is None:
+            raise HTTPException(404, f"Rank {rank} not registered in job {job_id}")
+        # 3) build a big schedule: for *each* freq, run through the pipe_schedule
+        schedule: list[tuple[str,int]] = []
+        for freq in ri.available_frequencies:
+            schedule.extend((inst, freq) for inst in ri.pipe_schedule)
+
+        return FrequencySchedule(rank=rank, frequencies=schedule)
 
     def report_profiling_result(self, job_id: str, result: ProfilingResult) -> None:
         """Send the profiling result to the job task and immediately return.
@@ -117,8 +128,8 @@ class JobManager:
         self._job_last_active_time[job_id] = time.monotonic()
 
     def report_timing(self, data) -> None:
-        """
-        Receive timing breakdown data from the client.
+        """Receive timing breakdown data from the client.
+
         `data` should contain fields: job_id, rank, timing_breakdown.
         """
         job_id = data.job_id
@@ -128,8 +139,8 @@ class JobManager:
         logger.info("Timing breakdown reported for job %s, rank %d", job_id, rank)
 
     def report_energy(self, data) -> None:
-        """
-        Receive energy measurement data from the client.
+        """Receive energy measurement data from the client.
+
         `data` should contain fields: job_id, rank, energy_measurements.
         """
         job_id = data.job_id
@@ -138,133 +149,93 @@ class JobManager:
         self._job_last_active_time[job_id] = time.monotonic()
         logger.info("Energy data reported for job %s, rank %d", job_id, rank)
 
-
+    def report_schedule(self, job_id: str, schedule: FrequencySchedule) -> None:
+        rank = schedule.rank
+        # Extract only frequencies
+        self._job_frequency_data[job_id][rank] = [freq for _, freq in schedule.frequencies]
+        # self._job_last_active_time[job_id] = time.monotonic()
+        logger.info("Frequency schedule reported for job %s", rank)
+        
     async def _cleanup_task(
         self,
         cleanup_period: int,
         max_idle_time: int,
     ) -> None:
-        """Periodically evict job states.
-
-        Args:
-            cleanup_period: How often to run the cleanup task, in seconds.
-            max_idle_time: Maximum amount of time a job can be idle for, in seconds.
-        """
         while True:
             await asyncio.sleep(cleanup_period)
-            for job_id in list(self._job_last_active_time.keys()):
-                if (
-                    time.monotonic() - self._job_last_active_time[job_id]
-                    > max_idle_time
-                ):
-                    self._job_tasks[job_id].cancel()
-                    del self._job_infos[job_id]
-                    del self._job_rank_infos[job_id]
-                    del self._job_result_channels[job_id]
-                    del self._job_sched_request_channels[job_id]
-                    del self._job_sched_response_channels[job_id]
-                    del self._job_tasks[job_id]
-                    del self._job_last_active_time[job_id]
-                    self._job_timing_data.pop(job_id, None)
-                    self._job_energy_data.pop(job_id, None)
-
+            now = time.monotonic()
+            for job_id, last in list(self._job_last_active_time.items()):
+                if now - last > max_idle_time:
+                    # Evict all state
+                    for d in (
+                        self._job_infos,
+                        self._job_rank_infos,
+                        self._job_timing_data,
+                        self._job_energy_data,
+                        self._job_frequency_data,
+                        self._job_last_active_time,
+                        # self._job_sched_request_channels,
+                        # self._job_sched_response_channels,
+                    ):
+                        d.pop(job_id, None)
+                        
     async def _job_task(self, job_id: str, dump_data: bool) -> None:
-        """Coalese requests and responses of each rank and interface with the scheduler."""
-        result_chan = self._job_result_channels[job_id]
-        sched_req_chan = self._job_sched_request_channels[job_id]
-        sched_resp_chan = self._job_sched_response_channels[job_id]
-
+        """
+        Waits until all ranks have reported RankInfo, timing, energy, and frequency,
+        then generates the profile CSV and exits.
+        """
         job_info = self._job_infos[job_id]
+        world_size = job_info.world_size
+        dump_dir = f"{self.pfo_settings.dump_dir}/{job_id}"
 
         try:
-            # Wait until all ranks have reported their `RankInfo`s.
-            rank_infos = self._job_rank_infos[job_id]
-            while True:
+            # 1) Wait for all ranks to register
+            while len(self._job_rank_infos[job_id]) < world_size:
                 await asyncio.sleep(0.1)
-                # Indexing the first element is always safe because this task is
-                # created after putting the `RankInfo` of the first-connected rank
-                # in `self.job_rank_infos[job_id]`.
-                if len(rank_infos) == job_info.world_size:
-                    break
 
-            # Sort `RankInfo`s in rank order.
-            rank_infos.sort(key=lambda r: r.rank)
-
-            # Create directory to dump PFO server states.
-            dump_dir = f"{self.pfo_settings.dump_dir}/{job_id}"
+            # 2) Optionally save rank metadata
             if dump_data:
-                await save_ranks(rank_infos, dump_dir)
+                await save_ranks(self._job_rank_infos[job_id], dump_dir)
 
-            # Instantiate the frequency scheduler.
-            scheduler = self.pfo_settings.scheduler(
-                job_info,
-                rank_infos,
-                self.pfo_settings,
-                **self.pfo_settings.scheduler_args,
-            )
-
-            # Provide next schedules, observe profiling results, and repeat.
-            schedule_num = 0
+            # 3) Wait for timing, energy, and frequency data
             while True:
-                # Compute the next `FrequencySchedule`s.
-                schedules = scheduler.next_schedule()
+                if (
+                    len(self._job_timing_data.get(job_id, {})) == world_size
+                    and len(self._job_energy_data.get(job_id, {})) == world_size
+                    and len(self._job_frequency_data.get(job_id, {})) == world_size
+                ):
+                    break
+                await asyncio.sleep(0.1)
 
-                # Wait until all the ranks ask for the next schedule.
-                await asyncio.gather(*[sched_req_chan.get() for _ in rank_infos])
+            # 4) Generate CSV profile
+            num_microbatches = job_info.num_microbatches
+            num_prof_steps = job_info.num_prof_steps
+            warmup_iters = job_info.warmup_iters
 
-                # Send out `FrequencySchedule`s.
-                await asyncio.gather(
-                    *[sched_resp_chan[s.rank].put(s) for s in schedules]
-                )
+            timing = self._job_timing_data[job_id]
+            energy = self._job_energy_data[job_id]
+            freq_map = self._job_frequency_data[job_id]
 
-                # Gather profiling results from all ranks.
-                results = await asyncio.gather(*[result_chan.get() for _ in rank_infos])
-                results.sort(key=lambda r: r.rank)
-
-                # Dump profiling results and schedules.
-                if dump_data:
-                    schedules.sort(key=lambda s: s.rank)
-                    await save_prof(results, dump_dir, schedule_num)
-                    await save_sched(schedules, dump_dir, schedule_num)
-
-                # Send `ProfilingResult`s to the scheduler.
-                scheduler.observe(results)
-
-                # Increment schedule number.
-                schedule_num += 1
-
-                if job_id in self._job_timing_data and job_id in self._job_energy_data:
-                    try:
-                        # Example: retrieve profiling parameters from PFOServerSettings, or use defaults.
-                        num_microbatches = getattr(self.pfo_settings, "num_microbatches", 1)
-                        num_prof_steps = getattr(self.pfo_settings, "num_prof_steps", 1)
-                        warmup_iters = getattr(self.pfo_settings, "warmup_iters", 0)
-                        
-                        csv_path = generate_profile_csv(
-                            job_id,
-                            self._job_timing_data[job_id],
-                            self._job_energy_data[job_id],
-                            dump_dir,
-                            num_microbatches,
-                            num_prof_steps,
-                            warmup_iters,
-                            frequency_schedule=None,  # Pass frequency schedule if available.
-                        )
-                        logger.info("CSV profile generated at: %s", csv_path)
-                    except Exception as e:
-                        logger.error("Failed to generate CSV profile for job %s: %s", job_id, e)
-
+            logger.info(f"Calling Profile CSV generation.")
+            
+            csv_path = generate_profile_csv(
+                job_id,
+                timing,
+                energy,
+                dump_dir,
+                num_microbatches,
+                num_prof_steps,
+                warmup_iters,
+                frequency_schedule=freq_map,
+            )
+            logger.info(f"Profile CSV generated at: {csv_path}")
 
         except asyncio.CancelledError:
             # This task gets cancelled when it's idle for too long and evicted.
             pass
 
-        except Exception as exc:
-            # In case the scheduler errored, send out the exception to the clients.
-            # The clients will receive the error when they ask for the next schedule.
-            for chan in sched_resp_chan:
-                chan.put_nowait(exc)
-            raise
+        except Exception as e:
+            logger.error(f"Error in job_task for job {job_id}: {e}")
 
 
 def init_global_job_manager(pfo_settings: PFOServerSettings) -> None:

@@ -7,10 +7,16 @@ the frequency of the CPU of the current process.
 """
 
 from __future__ import annotations
+from typing import Optional
+import multiprocessing as mp
+from multiprocessing import Event
+from pynvml import nvmlInit
 
 import httpx
 import torch
 import torch.distributed as dist
+import time
+import queue
 
 from zeus.callback import Callback
 from zeus.device import get_gpus
@@ -21,11 +27,27 @@ from zeus.optimizer.pipeline_frequency.common import (
     REGISTER_RANK_URL,
     REPORT_TIMING_URL,
     REPORT_ENERGY_URL,
+    REPORT_PROFILING_RESULT_URL,
+    REPORT_SCHEDULE_URL,
     JobInfo,
     RankInfo,
     FrequencySchedule,
 )
 from zeus.utils.framework import sync_execution
+
+# To be Removed
+import logging
+
+logger = logging.getLogger(__name__)
+
+def generate_pipe_schedule(num_microbatches: int) -> list[str]:
+            """Generate a pipeline schedule list.
+            
+            For each microbatch, we expect a forward followed by a backward instruction.
+            For example, if num_microbatches is 10, this returns a list with 20 items:
+            ["forward", "backward", "forward", "backward", ..., "forward", "backward"]
+            """
+            return ["forward", "backward"] * num_microbatches
 
 
 class PipelineFrequencyOptimizer(Callback):
@@ -44,6 +66,11 @@ class PipelineFrequencyOptimizer(Callback):
         world_size: int,
         server_url: str,
         job_metadata: str | None = None,
+        partition_method: Optional[str] = None,
+        microbatch_size: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+        num_prof_steps: Optional[int] = None,
+        warmup_iters: Optional[int] = None,
     ) -> None:
         """Initialize the Pipeline frequency optimizer.
 
@@ -82,6 +109,17 @@ class PipelineFrequencyOptimizer(Callback):
         self.tp_rank = tp_rank
         self.device_id = device_id
 
+        # pick defaults if user didn’t specify
+        DEFAULT_MICROBATCH_SIZE = 12
+        DEFAULT_NUM_MICROBATCHES = 4
+        DEFAULT_NUM_PROF_STEPS = 4
+        DEFAULT_WARMUP_ITERS = 2
+
+        self.microbatch_size = microbatch_size  or DEFAULT_MICROBATCH_SIZE
+        self.num_microbatches = num_microbatches or DEFAULT_NUM_MICROBATCHES
+        self.num_prof_steps = num_prof_steps     or DEFAULT_NUM_PROF_STEPS
+        self.warmup_iters = warmup_iters         or DEFAULT_WARMUP_ITERS
+
         gpus = get_gpus()
         torch.cuda.set_device(device_id)
 
@@ -94,10 +132,18 @@ class PipelineFrequencyOptimizer(Callback):
                 tp_degree=tp_degree,
                 world_size=world_size,
                 job_metadata=job_metadata,
+                framework="PyTorch",
+                model_name="TestModel",
+                partition_method=partition_method,
+                microbatch_size=self.microbatch_size,
+                num_microbatches=self.num_microbatches,
+                num_prof_steps=self.num_prof_steps,
+                warmup_iters=self.warmup_iters,
             )
-            response = httpx.post(
-                self.server_url + REGISTER_JOB_URL, json=job_info.dict()
-            )
+
+            # print("\nSending job_info:", job_info.dict())
+            response = httpx.post(self.server_url + REGISTER_JOB_URL, json=job_info.dict())
+            # print("\nRequest headers:", response.request.headers)
             if (code := response.status_code) != 200:
                 raise RuntimeError(
                     f"PFO server returned status code {code}: {response.text}"
@@ -120,6 +166,10 @@ class PipelineFrequencyOptimizer(Callback):
             reverse=True,
         )
 
+        # Query the pipeline schedule.
+        num_microbatches = num_microbatches if num_microbatches is not None else DEFAULT_NUM_MICROBATCHES
+        pipe_schedule = generate_pipe_schedule(num_microbatches)
+
         # Each rank reports itself to the PFO server with the job ID.
         rank_info = RankInfo(
             rank=self.rank,
@@ -127,6 +177,7 @@ class PipelineFrequencyOptimizer(Callback):
             pp_rank=self.pp_rank,
             tp_rank=self.tp_rank,
             available_frequencies=freqs,
+            pipe_schedule=pipe_schedule,
         )
         response = httpx.post(
             self.server_url + REGISTER_RANK_URL.format(job_id=self.job_id),
@@ -145,17 +196,27 @@ class PipelineFrequencyOptimizer(Callback):
         self.freq_schedule = self._get_frequency_schedule()
         self.freq_schedule_iter = iter(self.freq_schedule)
 
-         # Containers for timing and energy data.
+        # Containers for timing and energy data.
         self.timing_data = {"forward": [], "backward": []}
         self.energy_data = []
 
-        # Spawn energy polling process.
-        self.energy_polling_process = mp.Process(target=self._energy_polling_loop)
-        self.energy_polling_process.daemon = True
+        # print("Energy polling to be called now", flush=True)
+        # Start the energy polling process.
+        ctx = mp.get_context('spawn')
+        self._stop_event = ctx.Event()
+        self._energy_queue = ctx.Queue()
+
+        self.energy_polling_process = ctx.Process(
+            target=_energy_polling_loop,
+            args=(device_id, self._stop_event, self._energy_queue),
+            daemon=True
+        )
         self.energy_polling_process.start()
 
     def _get_frequency_schedule(self) -> list[tuple[str, int]]:
         """Get the frequency schedule from the PFO server."""
+        # print("\n Fetching frequency schedule from PFO server... \n", flush=True)
+        logger.info("Fetching frequency schedule from PFO server.")
         response = httpx.get(
             self.server_url + GET_FREQUENCY_SCHEDULE_URL.format(job_id=self.job_id),
             params={"rank": self.rank},
@@ -170,25 +231,33 @@ class PipelineFrequencyOptimizer(Callback):
             raise RuntimeError(
                 f"PFO server returned a schedule for rank {schedule.rank} to rank {self.rank}"
             )
+        logger.info("\n\n\nFrequency schedule: %d", len(schedule.frequencies))
+        # print("Frequency schedule length:", len(schedule.frequencies), schedule, flush=True)
+        
         return schedule.frequencies
+    
+    
 
     def on_step_begin(self) -> None:
         """Mark the beginning of a step."""
-        pass
+        self._step_start_time = time.time()
 
     def on_step_end(self) -> None:
         """Mark the end of a step.
+
         Also report the profiling result to the PFO server after N iterations.
         """
-        # Frequency schedule holds one iteration-worth of frequencies, so at
-        # the end of each iteration, the iterator should be exhausted.
-        item = next(self.freq_schedule_iter, None)
-        if item is not None:
-            raise RuntimeError(
-                "PFO server returned more frequencies than expected. "
-                f"Next expected instruction and frequency is {item}"
-            )
+        self.freq_schedule = self._get_frequency_schedule()
         self.freq_schedule_iter = iter(self.freq_schedule)
+        sched_payload = FrequencySchedule(
+            rank=self.rank,
+            frequencies=self.freq_schedule
+        )
+        httpx.post(
+            f"{self.server_url}{REPORT_SCHEDULE_URL.format(job_id=self.job_id)}",
+            json=sched_payload.dict(),
+            timeout=5
+        )
 
     def on_instruction_begin(self, name: str) -> None:
         """Mark the beginning of an instruction, like forward and backward.
@@ -198,7 +267,6 @@ class PipelineFrequencyOptimizer(Callback):
         frequency accordingly.
         """
         sync_execution([self.device_id], sync_with="torch")
-        # Record the start time for latency measurement.
         self._instr_start_time = time.time()
         # Retrieve the next frequency from the schedule.
         item = next(self.freq_schedule_iter, None)
@@ -208,67 +276,107 @@ class PipelineFrequencyOptimizer(Callback):
         # Check whether the next expected instruction matches the name of the instruction.
         instruction, frequency = item
         if instruction != name:
-            raise RuntimeError(
-                f"The next expected instruction is not forward: {instruction}"
+            logging.warning(
+                f"The next expected instruction does not match the passed name: {name}, instruction: {instruction}"
             )
-
-        self.frequency_controller.set_frequency(frequency)
+        try:
+            self.frequency_controller.set_frequency(frequency)
+        except Exception as e:
+            logging.warning(f"PFO: failed to set GPU freq {frequency}: {e}")
 
     def on_instruction_end(self, name: str) -> None:
         """Mark the end of an instruction, like forward and backward and report its latency."""
-        end_time  = time.time()
+        end_time = time.time()
         self.timing_data.setdefault(name, []).append((self._instr_start_time, end_time))
-        # Report timing data to the server.
-        payload = {
+
+    def on_train_end(self) -> None:
+        """Clean up when training is complete and send aggregated energy data."""
+        self.collect_energy()
+        self.stop_energy_polling()
+        # Create and send timing data payload to the server in one HTTP request.
+        timing_payload = {
             "job_id": self.job_id,
             "rank": self.rank,
             "timing_breakdown": self.timing_data,
-            
         }
         try:
-            httpx.post(f"{self.server_url}/{REPORT_TIMING_URL}", json=payload, timeout=5)
+            timing_url = (
+            f"{self.server_url}"
+            f"{REPORT_TIMING_URL.format(job_id=self.job_id)}"
+            )
+            httpx.post(timing_url, json=timing_payload, timeout=5)
+            
+            logger.info("Timing data successfully sent.")
         except Exception as e:
-            pass
+            logger.error("Error sending timing data:", e)
 
-    def _energy_polling_loop(self):
-        """Continuously measure energy and report measurements to the server."""
+        # Send aggregated energy data payload to the server in one HTTP request.
+        energy_payload = {
+            "job_id": self.job_id,
+            "rank": self.rank,
+            "energy_measurements": self.energy_data,
+        }
+        try:
+            energy_url = (
+            f"{self.server_url}"
+            f"{REPORT_ENERGY_URL.format(job_id=self.job_id)}"
+            )
+            httpx.post(energy_url, json=energy_payload, timeout=5)
+           
+            logger.info("Energy data successfully sent.")
+        except Exception as e:
+            logger.error("Error sending energy data:", e)
 
-        # we are aggregating in the generate_profile_csv function, hence not appending or collecting here.
-        # Please let me know if that should be changed
-        polling_interval = 1.0
-        gpus = get_gpus()
+    def collect_energy(self):
+        """Drain any pending measurements into your in‑memory list."""
         while True:
-            # Measure energy consumption over the polling interval.
-            measurement = self.measure_energy(polling_interval, gpus)
-            self.energy_data.append(measurement)
-            payload = {
-                "job_id": self.job_id,
-                "rank": self.rank,
-                "energy_measurements": [measurement],
-            }
             try:
-                httpx.post(f"{self.server_url}/{REPORT_ENERGY_URL}", json=payload, timeout=5)
-            except Exception as e:
-                pass
+                tag, payload = self._energy_queue.get_nowait()
+            except queue.Empty:
+                # No more items → clean exit
+                break
+            except Exception as e:  # queue empty
+                logger.info("Energy polling error: %s", e)
+                break
 
-    def measure_energy(self, polling_interval: float, gpus) -> tuple[float, float]:
-        """
-        Measure GPU energy consumption over a polling interval.
-        
-        Args:
-            polling_interval: Duration (in seconds) over which to measure energy.
-            gpus: The GPU interface obtained from get_gpus().
-        
-        Returns:
-            A tuple (timestamp, energy_delta) where:
-              - timestamp: The time at the end of the measurement window.
-              - energy_delta: The difference in energy consumption (in Joules) over the interval.
-        """
-        start_time = time.time()
-        start_energy = gpus.getTotalEnergyConsumption(self.device_id) / 1000.0
-        time.sleep(polling_interval)
-        end_time = time.time()
-        end_energy = gpus.getTotalEnergyConsumption(self.device_id) / 1000.0
-        energy_delta = end_energy - start_energy
-        return (end_time, energy_delta)
+            if tag == "data":
+                timestamp, joules = payload
+                # print("\nCollecting energy into energy_data\n", flush=True)
+                self.energy_data.append((timestamp, joules))
+            else:
+                logger.error("Energy polling error: %s", payload)
 
+    def stop_energy_polling(self) -> None:
+        """Stop the energy polling process gracefully."""
+        if hasattr(self, "energy_polling_process"):
+            self._stop_event.set()
+            self.energy_polling_process.join()
+            
+
+
+def _energy_polling_loop(device_id: int,
+                         stop_event: mp.Event,
+                         out_queue: mp.Queue,
+                        ):
+        """Continuously poll energy and aggregate measurements for later reporting."""
+        try:
+            nvmlInit()
+        except Exception as e:
+            logger.error("Failed to init NVML in polling process: %s", e)
+            return
+        
+        gpus = get_gpus()
+        prev_measurement = None
+        while True:
+            # Poll continuously
+            curr_time = time.time()
+            curr_energy = gpus.getTotalEnergyConsumption(device_id) / 1000.0
+            measurement = (curr_time, curr_energy)
+            # Deduplicate: only add if measurement is different from the last one.
+            if measurement != prev_measurement:
+                # sending measurement in ctx.queue
+                out_queue.put(("data", measurement))
+                prev_measurement = measurement
+            if stop_event.is_set():
+                # print("\nStop Event Detected, stopping energy polling\n", flush=True)
+                break

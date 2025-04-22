@@ -17,8 +17,10 @@ REGISTER_JOB_URL = "/register_job"
 REGISTER_RANK_URL = "/register_rank/{job_id}"
 GET_FREQUENCY_SCHEDULE_URL = "/schedule/{job_id}"
 REPORT_PROFILING_RESULT_URL = "/result/{job_id}"
-REPORT_TIMING_URL = "/report_timing"
-REPORT_ENERGY_URL = "/report_energy"
+REPORT_TIMING_URL = "/profile/time/{job_id}"
+REPORT_ENERGY_URL = "/profile/energy/{job_id}"
+REPORT_SCHEDULE_URL = "/schedule/{job_id}"
+
 
 class PFOServerSettings(BaseSettings):
     """PFO server settings, configurable via environment variables.
@@ -88,6 +90,8 @@ class JobInfo(BaseModel):
         partition_method: Pipeline partition method used.
         microbatch_size: Microbatch size used in training.
         num_microbatches: Number of microbatches in training.
+        num_prof_steps: Number of profiling steps per iteration.
+        warmup_iters: Number of warmup iterations to skip for profiling.
     """
 
     job_id: str = ""
@@ -101,6 +105,8 @@ class JobInfo(BaseModel):
     partition_method: Optional[str] = None
     microbatch_size: Optional[int] = None
     num_microbatches: Optional[int] = None
+    num_prof_steps: Optional[int] = None
+    warmup_iters: Optional[int] = None
 
     @validator("job_id")
     def _check_empty_job_id(cls, job_id):
@@ -156,7 +162,7 @@ class RankInfo(BaseModel):
     pp_rank: int = Field(ge=0)
     tp_rank: int = Field(ge=0)
     available_frequencies: list[int]
-    pipe_schedule: list[str] = []
+    pipe_schedule: list[str] = ["forward", "backward"]
 
     @validator("pipe_schedule", pre=True, always=True)
     def validate_pipe_schedule(cls, value):
