@@ -121,7 +121,9 @@ pip install "pydantic<2"
 pip install .[pfo, pfo-server] --no-deps
 pip install aiofiles fastapi starlette uvicorn --no-deps
 pip uninstall pynvml # because we use nvidia-ml-py
+```
 
+```bash
 # Configure and launch the server on a separate docker root access
 docker ps # for fetching name of your container - e.g. c8dab19234f
 docker exec -it <your-zeus-container-name> bash  # this will lauch another terminal with access to same docker
